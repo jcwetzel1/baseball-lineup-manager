@@ -1,0 +1,919 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Baseball Lineup Manager</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  body { -webkit-tap-highlight-color: transparent; overscroll-behavior: none; }
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  .fade-in { animation: fadeIn 0.25s ease-out; }
+</style>
+</head>
+<body class="bg-gray-900 text-white">
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback, useMemo, useRef } = React;
+
+// ── Constants ──────────────────────────────────────────────────────────
+const ROSTER = [
+  'Artie Wetzel','Beckett Clarkin','Dylan Kalish','Ethan Hertlein',
+  'Hudson Bardasian','James Martin','Javier Peregrino Armas','Kolton High',
+  'Miles Cooney','Peter Mantovani','Teddy Klein','Teddy Blaser',
+  'Teddy MacDonald','Warren Steffens','William Janisse','William Kay'
+];
+
+const POSITIONS = ['P','C','1B','2B','SS','3B','LF','CF','RF'];
+const FIELD_POSITIONS = ['1B','2B','SS','3B','LF','CF','RF'];
+const INFIELD = new Set(['1B','2B','SS','3B']);
+const OUTFIELD = new Set(['LF','CF','RF']);
+
+const shortName = (name) => {
+  const parts = name.split(' ');
+  if (parts[0] === 'William') return 'W. ' + parts[1];
+  if (parts[0] === 'Teddy') return 'T. ' + parts[1];
+  if (parts[0] === 'Javier') return 'Javier PA';
+  return parts[0];
+};
+
+// ── Position Scoring (maximize variety) ────────────────────────────────
+function scorePos(player, pos, stats, eligibility) {
+  let s = 0;
+  if (!eligibility[player]?.[pos]) s -= 500;
+  // Penalize positions already played — strongly avoid repeats
+  if (stats[player].positions.includes(pos)) s -= 100;
+  const timesAtPos = stats[player].positions.filter(p => p === pos).length;
+  s -= timesAtPos * 50;
+  // Balance infield / outfield
+  if (INFIELD.has(pos)) {
+    s -= stats[player].infieldN * 8;
+    s += stats[player].outfieldN * 4;
+  }
+  if (OUTFIELD.has(pos)) {
+    s -= stats[player].outfieldN * 8;
+    s += stats[player].infieldN * 4;
+  }
+  s += Math.random() * 3;
+  return s;
+}
+
+// ── Catcher Schedule Builder ───────────────────────────────────────────
+// Sorts catchers by most innings first (primary catcher starts the game),
+// then assigns contiguous blocks.
+function buildCatcherSchedule(catcherPlan, numInnings, pitcher) {
+  // Sort by most innings first (primary catcher starts the game)
+  const sorted = [...catcherPlan]
+    .filter(cp => cp.player !== pitcher) // safety: never schedule pitcher as catcher
+    .sort((a, b) => b.innings - a.innings);
+  const schedule = {};
+  let ci = 1;
+  for (const cp of sorted) {
+    for (let i = 0; i < cp.innings && ci <= numInnings; i++, ci++) {
+      schedule[ci] = cp.player;
+    }
+  }
+  return schedule;
+}
+
+// ── Field Plan Generation ──────────────────────────────────────────────
+function generateFieldPlan(players, eligibility, numInnings, catcherPlan, pitcher) {
+  const n = players.length;
+  if (n === 0) return [];
+  const fieldSize = Math.min(9, n);
+
+  const catcherSchedule = buildCatcherSchedule(catcherPlan, numInnings, pitcher);
+
+  const stats = {};
+  players.forEach(p => {
+    stats[p] = { positions: [], infieldN: 0, outfieldN: 0, benchN: 0, lastBench: -99, playN: 0 };
+  });
+
+  const plan = [];
+
+  for (let inn = 1; inn <= numInnings; inn++) {
+    const assignment = {};
+    assignment.P = pitcher;
+    if (catcherSchedule[inn]) assignment.C = catcherSchedule[inn];
+
+    const batterySet = new Set(Object.values(assignment));
+    const available = players.filter(p => !batterySet.has(p));
+
+    // Bench rotation
+    const benchSize = Math.max(0, n - fieldSize);
+    let sitters = [];
+    if (benchSize > 0 && available.length > fieldSize - batterySet.size) {
+      const mustPlay = available.filter(p => stats[p].lastBench === inn - 1);
+      const canSit = available.filter(p => stats[p].lastBench !== inn - 1);
+      const numToSit = available.length - (fieldSize - batterySet.size);
+
+      canSit.sort((a, b) => {
+        const diff = stats[a].benchN - stats[b].benchN;
+        if (diff !== 0) return diff;
+        return stats[a].playN - stats[b].playN;
+      });
+
+      sitters = canSit.slice(0, Math.max(0, numToSit));
+      if (sitters.length < numToSit) {
+        sitters = sitters.concat(mustPlay.slice(0, numToSit - sitters.length));
+      }
+    }
+
+    const sitterSet = new Set(sitters);
+    const fielders = available.filter(p => !sitterSet.has(p));
+
+    // Assign positions using greedy scoring (most constrained positions first)
+    const posToFill = FIELD_POSITIONS.filter(p => !assignment[p]);
+    const posOrder = [...posToFill].sort((a, b) => {
+      const ae = fielders.filter(p => eligibility[p]?.[a]).length;
+      const be = fielders.filter(p => eligibility[p]?.[b]).length;
+      return ae - be;
+    });
+
+    const used = new Set();
+    for (const pos of posOrder) {
+      const candidates = fielders.filter(p => !used.has(p));
+      if (candidates.length === 0) break;
+      candidates.sort((a, b) => scorePos(b, pos, stats, eligibility) - scorePos(a, pos, stats, eligibility));
+      assignment[pos] = candidates[0];
+      used.add(candidates[0]);
+    }
+
+    // Any remaining unassigned fielders go to remaining open positions
+    const unassignedPos = FIELD_POSITIONS.filter(p => !assignment[p]);
+    const unassignedPlayers = fielders.filter(p => !used.has(p));
+    for (let i = 0; i < Math.min(unassignedPos.length, unassignedPlayers.length); i++) {
+      assignment[unassignedPos[i]] = unassignedPlayers[i];
+    }
+
+    // Update stats
+    const bench = [...sitters];
+    for (const p of players) {
+      const pos = Object.entries(assignment).find(([, v]) => v === p)?.[0];
+      if (pos) {
+        stats[p].positions.push(pos);
+        stats[p].playN++;
+        if (INFIELD.has(pos)) stats[p].infieldN++;
+        if (OUTFIELD.has(pos)) stats[p].outfieldN++;
+      } else {
+        stats[p].benchN++;
+        stats[p].lastBench = inn;
+        if (!bench.includes(p)) bench.push(p);
+      }
+    }
+
+    plan.push({ positions: { ...assignment }, bench });
+  }
+
+  return plan;
+}
+
+// ── Regenerate Plan (after pitcher change) ─────────────────────────────
+function regeneratePlan(players, eligibility, numInnings, catcherPlan, pitcher, completedInnings) {
+  const n = players.length;
+  if (n === 0) return [];
+  const fieldSize = Math.min(9, n);
+
+  const catcherSchedule = buildCatcherSchedule(catcherPlan, numInnings, pitcher);
+
+  const stats = {};
+  players.forEach(p => {
+    stats[p] = { positions: [], infieldN: 0, outfieldN: 0, benchN: 0, lastBench: -99, playN: 0 };
+  });
+
+  // Replay completed innings into stats
+  for (let i = 0; i < completedInnings.length; i++) {
+    const inn = completedInnings[i];
+    for (const p of players) {
+      const pos = Object.entries(inn.positions).find(([, v]) => v === p)?.[0];
+      if (pos) {
+        stats[p].positions.push(pos);
+        stats[p].playN++;
+        if (INFIELD.has(pos)) stats[p].infieldN++;
+        if (OUTFIELD.has(pos)) stats[p].outfieldN++;
+      } else {
+        stats[p].benchN++;
+        stats[p].lastBench = i + 1;
+      }
+    }
+  }
+
+  // Generate remaining innings
+  const remaining = [];
+  for (let inn = completedInnings.length + 1; inn <= numInnings; inn++) {
+    const assignment = {};
+    assignment.P = pitcher;
+    if (catcherSchedule[inn]) assignment.C = catcherSchedule[inn];
+
+    const batterySet = new Set(Object.values(assignment));
+    const available = players.filter(p => !batterySet.has(p));
+    const benchSize = Math.max(0, n - fieldSize);
+
+    let sitters = [];
+    if (benchSize > 0 && available.length > fieldSize - batterySet.size) {
+      const mustPlay = available.filter(p => stats[p].lastBench === inn - 1);
+      const canSit = available.filter(p => stats[p].lastBench !== inn - 1);
+      const numToSit = available.length - (fieldSize - batterySet.size);
+      canSit.sort((a, b) => {
+        const diff = stats[a].benchN - stats[b].benchN;
+        if (diff !== 0) return diff;
+        return stats[a].playN - stats[b].playN;
+      });
+      sitters = canSit.slice(0, Math.max(0, numToSit));
+      if (sitters.length < numToSit) {
+        sitters = sitters.concat(mustPlay.slice(0, numToSit - sitters.length));
+      }
+    }
+
+    const sitterSet = new Set(sitters);
+    const fielders = available.filter(p => !sitterSet.has(p));
+
+    const posToFill = FIELD_POSITIONS.filter(p => !assignment[p]);
+    const posOrder = [...posToFill].sort((a, b) => {
+      const ae = fielders.filter(p => eligibility[p]?.[a]).length;
+      const be = fielders.filter(p => eligibility[p]?.[b]).length;
+      return ae - be;
+    });
+
+    const used = new Set();
+    for (const pos of posOrder) {
+      const candidates = fielders.filter(p => !used.has(p));
+      if (candidates.length === 0) break;
+      candidates.sort((a, b) => scorePos(b, pos, stats, eligibility) - scorePos(a, pos, stats, eligibility));
+      assignment[pos] = candidates[0];
+      used.add(candidates[0]);
+    }
+
+    const unassignedPos = FIELD_POSITIONS.filter(p => !assignment[p]);
+    const unassignedPlayers = fielders.filter(p => !used.has(p));
+    for (let i = 0; i < Math.min(unassignedPos.length, unassignedPlayers.length); i++) {
+      assignment[unassignedPos[i]] = unassignedPlayers[i];
+    }
+
+    const bench = [...sitters];
+    for (const p of players) {
+      const pos = Object.entries(assignment).find(([, v]) => v === p)?.[0];
+      if (pos) {
+        stats[p].positions.push(pos);
+        stats[p].playN++;
+        if (INFIELD.has(pos)) stats[p].infieldN++;
+        if (OUTFIELD.has(pos)) stats[p].outfieldN++;
+      } else {
+        stats[p].benchN++;
+        stats[p].lastBench = inn;
+        if (!bench.includes(p)) bench.push(p);
+      }
+    }
+
+    remaining.push({ positions: { ...assignment }, bench });
+  }
+
+  return [...completedInnings, ...remaining];
+}
+
+// ── Components ─────────────────────────────────────────────────────────
+
+function Toggle({ on, onToggle, label, small }) {
+  return (
+    <button
+      onClick={onToggle}
+      className={`flex items-center gap-2 px-3 ${small ? 'py-1.5 text-sm' : 'py-2.5'} rounded-lg w-full text-left transition-colors ${
+        on ? 'bg-green-700/60 border border-green-500/50' : 'bg-gray-800 border border-gray-700'
+      }`}
+    >
+      <div className={`w-5 h-5 rounded flex items-center justify-center text-xs font-bold ${
+        on ? 'bg-green-500 text-white' : 'bg-gray-600 text-gray-400'
+      }`}>
+        {on ? '✓' : ''}
+      </div>
+      <span className={on ? 'text-white' : 'text-gray-400'}>{label}</span>
+    </button>
+  );
+}
+
+function Section({ title, children, defaultOpen = true }) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className="mb-4 bg-gray-800/50 rounded-xl border border-gray-700/50 overflow-hidden">
+      <button onClick={() => setOpen(!open)}
+        className="w-full flex items-center justify-between px-4 py-3 text-left">
+        <span className="font-semibold text-lg">{title}</span>
+        <span className="text-gray-400 text-xl">{open ? '−' : '+'}</span>
+      </button>
+      {open && <div className="px-4 pb-4">{children}</div>}
+    </div>
+  );
+}
+
+// ── Scoreboard Component ───────────────────────────────────────────────
+function Scoreboard({ score, setScore, inning, isTop }) {
+  const adjust = (team, delta) => {
+    setScore(prev => ({ ...prev, [team]: Math.max(0, (prev[team] || 0) + delta) }));
+  };
+  return (
+    <div className="bg-gray-800/80 rounded-xl border border-gray-700/50 p-3 mb-4">
+      <div className="grid grid-cols-3 gap-2 items-center">
+        <div className="text-center">
+          <div className="text-xs font-bold text-blue-400 mb-1">OLOL</div>
+          <div className="flex items-center justify-center gap-2">
+            <button onClick={() => adjust('olol', -1)}
+              className="w-8 h-8 rounded-lg bg-gray-700 text-gray-300 font-bold text-lg flex items-center justify-center">-</button>
+            <span className="text-2xl font-bold w-8 text-center">{score.olol || 0}</span>
+            <button onClick={() => adjust('olol', 1)}
+              className="w-8 h-8 rounded-lg bg-blue-700 text-white font-bold text-lg flex items-center justify-center">+</button>
+          </div>
+        </div>
+        <div className="text-center">
+          <div className={`text-sm font-medium ${isTop ? 'text-yellow-400' : 'text-blue-400'}`}>
+            {isTop ? '▲' : '▼'} {inning}
+          </div>
+        </div>
+        <div className="text-center">
+          <div className="text-xs font-bold text-red-400 mb-1">OTHER GUYS</div>
+          <div className="flex items-center justify-center gap-2">
+            <button onClick={() => adjust('other', -1)}
+              className="w-8 h-8 rounded-lg bg-gray-700 text-gray-300 font-bold text-lg flex items-center justify-center">-</button>
+            <span className="text-2xl font-bold w-8 text-center">{score.other || 0}</span>
+            <button onClick={() => adjust('other', 1)}
+              className="w-8 h-8 rounded-lg bg-red-700 text-white font-bold text-lg flex items-center justify-center">+</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Setup Screen ───────────────────────────────────────────────────────
+function SetupScreen({ onGenerate }) {
+  const [attendance, setAttendance] = useState(() => {
+    const a = {};
+    ROSTER.forEach(p => a[p] = true);
+    return a;
+  });
+
+  const [eligibility, setEligibility] = useState(() => {
+    const e = {};
+    ROSTER.forEach(p => {
+      e[p] = {};
+      POSITIONS.forEach(pos => e[p][pos] = true);
+    });
+    return e;
+  });
+
+  const [innings, setInnings] = useState(6);
+  const [isHome, setIsHome] = useState(true);
+  const [catcherPlan, setCatcherPlan] = useState([]);
+  const [pitcher, setPitcherRaw] = useState('');
+  const setPitcher = (p) => {
+    setPitcherRaw(p);
+    // Remove any catcher entries that conflict with the new pitcher
+    setCatcherPlan(prev => prev.filter(c => c.player !== p));
+  };
+  const [expandedPlayer, setExpandedPlayer] = useState(null);
+
+  const attending = ROSTER.filter(p => attendance[p]);
+
+  const toggleAttendance = (p) => setAttendance(prev => ({ ...prev, [p]: !prev[p] }));
+
+  const toggleEligibility = (player, pos) => {
+    setEligibility(prev => ({
+      ...prev,
+      [player]: { ...prev[player], [pos]: !prev[player][pos] }
+    }));
+  };
+
+  const addCatcher = () => {
+    const available = attending.filter(p => eligibility[p]?.C && p !== pitcher && !catcherPlan.find(c => c.player === p));
+    if (available.length > 0) {
+      setCatcherPlan(prev => [...prev, { player: available[0], innings: 2 }]);
+    }
+  };
+
+  const removeCatcher = (idx) => setCatcherPlan(prev => prev.filter((_, i) => i !== idx));
+
+  const updateCatcher = (idx, field, val) => {
+    setCatcherPlan(prev => prev.map((c, i) => i === idx ? { ...c, [field]: val } : c));
+  };
+
+  const totalCatcherInnings = catcherPlan.reduce((s, c) => s + c.innings, 0);
+  const canGenerate = attending.length >= 2 && pitcher && catcherPlan.length > 0;
+
+  const handleGenerate = () => {
+    onGenerate({ players: attending, eligibility, innings, isHome, catcherPlan, pitcher });
+  };
+
+  return (
+    <div className="fade-in">
+      <div className="text-center py-4 mb-2">
+        <h1 className="text-2xl font-bold">⚾ Lineup Manager</h1>
+        <p className="text-gray-400 text-sm mt-1">3rd Grade Baseball</p>
+      </div>
+
+      <Section title="Game Settings">
+        <div className="flex gap-3 mb-3">
+          <div className="flex-1">
+            <label className="text-sm text-gray-400 block mb-1">Innings</label>
+            <select value={innings} onChange={e => setInnings(Number(e.target.value))}
+              className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2.5 text-white">
+              {[1,2,3,4,5,6,7,8,9].map(i => <option key={i} value={i}>{i}</option>)}
+            </select>
+          </div>
+          <div className="flex-1">
+            <label className="text-sm text-gray-400 block mb-1">Team</label>
+            <div className="flex rounded-lg overflow-hidden border border-gray-600">
+              <button onClick={() => setIsHome(false)}
+                className={`flex-1 py-2.5 text-sm font-medium ${!isHome ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-400'}`}
+              >Away</button>
+              <button onClick={() => setIsHome(true)}
+                className={`flex-1 py-2.5 text-sm font-medium ${isHome ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-400'}`}
+              >Home</button>
+            </div>
+          </div>
+        </div>
+      </Section>
+
+      <Section title={`Attendance (${attending.length} players)`}>
+        <div className="grid grid-cols-2 gap-2">
+          {ROSTER.map(p => (
+            <Toggle key={p} on={attendance[p]} onToggle={() => toggleAttendance(p)} label={shortName(p)} />
+          ))}
+        </div>
+      </Section>
+
+      <Section title="Position Eligibility" defaultOpen={false}>
+        <p className="text-sm text-gray-400 mb-3">Tap a player to set which positions they can play. All positions are enabled by default. Players rotate to new positions each inning.</p>
+        <div className="space-y-2">
+          {attending.map(p => (
+            <div key={p} className="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
+              <button onClick={() => setExpandedPlayer(expandedPlayer === p ? null : p)}
+                className="w-full flex items-center justify-between px-3 py-2.5 text-left">
+                <span className="font-medium">{shortName(p)}</span>
+                <span className="text-xs text-gray-400">
+                  {POSITIONS.filter(pos => eligibility[p]?.[pos]).length}/9
+                  <span className="ml-2">{expandedPlayer === p ? '▲' : '▼'}</span>
+                </span>
+              </button>
+              {expandedPlayer === p && (
+                <div className="px-3 pb-3 grid grid-cols-3 gap-1.5">
+                  {POSITIONS.map(pos => (
+                    <Toggle key={pos} small on={eligibility[p]?.[pos]}
+                      onToggle={() => toggleEligibility(p, pos)} label={pos} />
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </Section>
+
+      <Section title="Starting Pitcher">
+        <select value={pitcher} onChange={e => setPitcher(e.target.value)}
+          className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2.5 text-white">
+          <option value="">Select pitcher...</option>
+          {attending.filter(p => eligibility[p]?.P).map(p => (
+            <option key={p} value={p}>{p}</option>
+          ))}
+        </select>
+      </Section>
+
+      <Section title="Catcher Plan">
+        <p className="text-sm text-gray-400 mb-3">
+          Assign catchers and how many innings each catches. The app will order them optimally (primary catcher first).
+          {totalCatcherInnings > 0 && (
+            <span className={totalCatcherInnings >= innings ? ' text-green-400' : ' text-yellow-400'}>
+              {' '}({totalCatcherInnings}/{innings} innings covered)
+            </span>
+          )}
+        </p>
+        {catcherPlan.map((cp, idx) => (
+          <div key={idx} className="flex items-center gap-2 mb-2">
+            <select value={cp.player} onChange={e => updateCatcher(idx, 'player', e.target.value)}
+              className="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-2 py-2 text-white text-sm">
+              {attending.filter(p => eligibility[p]?.C && p !== pitcher).map(p => (
+                <option key={p} value={p}>{shortName(p)}</option>
+              ))}
+            </select>
+            <select value={cp.innings} onChange={e => updateCatcher(idx, 'innings', Number(e.target.value))}
+              className="w-20 bg-gray-700 border border-gray-600 rounded-lg px-2 py-2 text-white text-sm">
+              {[1,2,3,4,5,6,7,8,9].map(i => <option key={i} value={i}>{i} inn</option>)}
+            </select>
+            <button onClick={() => removeCatcher(idx)} className="text-red-400 px-2 py-2 text-lg">✕</button>
+          </div>
+        ))}
+        <button onClick={addCatcher}
+          className="w-full py-2.5 border border-dashed border-gray-600 rounded-lg text-gray-400 text-sm"
+        >+ Add Catcher</button>
+      </Section>
+
+      <div className="sticky bottom-0 bg-gray-900/95 backdrop-blur border-t border-gray-700 p-4 -mx-4">
+        <button disabled={!canGenerate} onClick={handleGenerate}
+          className={`w-full py-3.5 rounded-xl font-bold text-lg ${
+            canGenerate ? 'bg-green-600 hover:bg-green-500 text-white' : 'bg-gray-700 text-gray-500'
+          }`}>Generate Lineup</button>
+        {!canGenerate && (
+          <p className="text-xs text-gray-500 text-center mt-2">
+            {!pitcher ? 'Select a starting pitcher' : catcherPlan.length === 0 ? 'Add at least one catcher' : 'Need at least 2 players'}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Review Screen ──────────────────────────────────────────────────────
+function ReviewScreen({ config, battingOrder, setBattingOrder, fieldPlan, onStart, onBack }) {
+  const movePlayer = (idx, dir) => {
+    const newOrder = [...battingOrder];
+    const newIdx = idx + dir;
+    if (newIdx < 0 || newIdx >= newOrder.length) return;
+    [newOrder[idx], newOrder[newIdx]] = [newOrder[newIdx], newOrder[idx]];
+    setBattingOrder(newOrder);
+  };
+
+  return (
+    <div className="fade-in">
+      <div className="flex items-center justify-between py-4 mb-2">
+        <button onClick={onBack} className="text-blue-400 px-2 py-1">← Setup</button>
+        <h1 className="text-xl font-bold">Review Lineup</h1>
+        <div className="w-16" />
+      </div>
+
+      <Section title="Batting Order">
+        <p className="text-xs text-gray-400 mb-3">Tap arrows to reorder. All players bat continuously.</p>
+        <div className="space-y-1">
+          {battingOrder.map((p, idx) => (
+            <div key={p} className="flex items-center gap-2 bg-gray-800 rounded-lg px-3 py-2 border border-gray-700">
+              <span className="text-gray-500 text-sm w-6 text-right">{idx + 1}.</span>
+              <span className="flex-1 font-medium text-sm">{shortName(p)}</span>
+              <button onClick={() => movePlayer(idx, -1)} disabled={idx === 0}
+                className={`w-8 h-8 rounded flex items-center justify-center text-lg ${idx === 0 ? 'text-gray-600' : 'text-blue-400 bg-gray-700'}`}
+              >↑</button>
+              <button onClick={() => movePlayer(idx, 1)} disabled={idx === battingOrder.length - 1}
+                className={`w-8 h-8 rounded flex items-center justify-center text-lg ${idx === battingOrder.length - 1 ? 'text-gray-600' : 'text-blue-400 bg-gray-700'}`}
+              >↓</button>
+            </div>
+          ))}
+        </div>
+      </Section>
+
+      <Section title="Field Plan (Preview)">
+        <div className="space-y-3 no-scrollbar" style={{maxHeight: '50vh', overflowY: 'auto'}}>
+          {fieldPlan.map((inn, idx) => (
+            <div key={idx} className="bg-gray-800 rounded-lg p-3 border border-gray-700">
+              <div className="font-semibold text-sm text-blue-400 mb-2">Inning {idx + 1}</div>
+              <div className="grid grid-cols-3 gap-1 text-xs">
+                {POSITIONS.map(pos => (
+                  <div key={pos} className={`px-2 py-1 rounded ${
+                    pos === 'P' ? 'bg-red-900/40 text-red-300' :
+                    pos === 'C' ? 'bg-purple-900/40 text-purple-300' :
+                    INFIELD.has(pos) ? 'bg-blue-900/40 text-blue-300' :
+                    'bg-green-900/40 text-green-300'
+                  }`}>
+                    <span className="font-bold">{pos}:</span> {inn.positions[pos] ? shortName(inn.positions[pos]) : '—'}
+                  </div>
+                ))}
+              </div>
+              {inn.bench.length > 0 && (
+                <div className="mt-2 text-xs text-gray-500">
+                  Bench: {inn.bench.map(shortName).join(', ')}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </Section>
+
+      <div className="sticky bottom-0 bg-gray-900/95 backdrop-blur border-t border-gray-700 p-4 -mx-4">
+        <button onClick={onStart}
+          className="w-full py-3.5 rounded-xl font-bold text-lg bg-blue-600 hover:bg-blue-500 text-white"
+        >Start Game</button>
+      </div>
+    </div>
+  );
+}
+
+// ── Diamond Visualization ──────────────────────────────────────────────
+function DiamondView({ positions }) {
+  const coords = {
+    'P':  { top: '52%', left: '50%' },
+    'C':  { top: '82%', left: '50%' },
+    '1B': { top: '50%', left: '76%' },
+    '2B': { top: '36%', left: '62%' },
+    'SS': { top: '36%', left: '38%' },
+    '3B': { top: '50%', left: '24%' },
+    'LF': { top: '16%', left: '20%' },
+    'CF': { top: '8%', left: '50%' },
+    'RF': { top: '16%', left: '80%' },
+  };
+
+  return (
+    <div className="relative w-full bg-green-900/30 rounded-xl border border-green-800/50" style={{paddingBottom: '90%'}}>
+      <svg className="absolute inset-0 w-full h-full" viewBox="0 0 100 100" preserveAspectRatio="none">
+        <polygon points="50,40 72,55 50,72 28,55" fill="none" stroke="rgba(139,92,52,0.4)" strokeWidth="0.5"/>
+        <path d="M 20,20 Q 50,5 80,20" fill="none" stroke="rgba(255,255,255,0.1)" strokeWidth="0.3"/>
+      </svg>
+      {Object.entries(coords).map(([pos, style]) => (
+        <div key={pos} className="absolute transform -translate-x-1/2 -translate-y-1/2 text-center"
+          style={{ top: style.top, left: style.left }}>
+          <div className={`text-[10px] font-bold px-1 rounded ${
+            pos === 'P' ? 'bg-red-600/80' :
+            pos === 'C' ? 'bg-purple-600/80' :
+            INFIELD.has(pos) ? 'bg-blue-600/80' :
+            'bg-green-600/80'
+          }`}>{pos}</div>
+          <div className="text-xs font-medium mt-0.5 whitespace-nowrap bg-gray-900/70 px-1 rounded">
+            {positions[pos] ? shortName(positions[pos]) : '—'}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Game Screen ────────────────────────────────────────────────────────
+function GameScreen({ config, battingOrder, fieldPlan, setFieldPlan, score, setScore, onEnd }) {
+  const [inning, setInning] = useState(1);
+  const [isTop, setIsTop] = useState(true);
+  const [currentBatter, setCurrentBatter] = useState(0);
+  const [showPitcherModal, setShowPitcherModal] = useState(false);
+  const [showLastOutModal, setShowLastOutModal] = useState(false);
+  const [gameOver, setGameOver] = useState(false);
+
+  const { isHome, innings: maxInnings, players, eligibility, catcherPlan } = config;
+
+  const isBatting = (isTop && !isHome) || (!isTop && isHome);
+  const currentFieldPlan = fieldPlan[inning - 1];
+  const currentPitcher = currentFieldPlan?.positions?.P || '';
+
+  const doAdvanceHalf = () => {
+    if (isTop) {
+      setIsTop(false);
+    } else {
+      if (inning >= maxInnings) {
+        setGameOver(true);
+        return;
+      }
+      setInning(inning + 1);
+      setIsTop(true);
+    }
+  };
+
+  const advanceHalf = () => {
+    if (isBatting) {
+      setShowLastOutModal(true);
+    } else {
+      doAdvanceHalf();
+    }
+  };
+
+  const handleLastOutSelected = (playerIdx) => {
+    const nextIdx = (playerIdx + 1) % battingOrder.length;
+    setCurrentBatter(nextIdx);
+    setShowLastOutModal(false);
+    doAdvanceHalf();
+  };
+
+  const changePitcher = (newPitcher) => {
+    // Swap: new pitcher goes to P, old pitcher takes new pitcher's current spot
+    const currentPositions = { ...fieldPlan[inning - 1].positions };
+    const oldPitcher = currentPositions.P;
+    const newPitcherOldPos = Object.entries(currentPositions).find(([, v]) => v === newPitcher)?.[0];
+
+    currentPositions.P = newPitcher;
+    if (newPitcherOldPos) {
+      currentPositions[newPitcherOldPos] = oldPitcher;
+    }
+
+    const updatedCurrent = { ...fieldPlan[inning - 1], positions: currentPositions };
+    const completed = [...fieldPlan.slice(0, inning - 1), updatedCurrent];
+    const newPlan = regeneratePlan(players, eligibility, maxInnings, catcherPlan, newPitcher, completed);
+    setFieldPlan(newPlan);
+    setShowPitcherModal(false);
+  };
+
+  if (gameOver) {
+    return (
+      <div className="fade-in text-center py-8">
+        <div className="text-6xl mb-4">⚾</div>
+        <h2 className="text-2xl font-bold mb-4">Game Over!</h2>
+        <div className="bg-gray-800 rounded-xl p-4 mb-6 border border-gray-700 inline-block mx-auto">
+          <div className="grid grid-cols-2 gap-6 text-center">
+            <div>
+              <div className="text-sm font-bold text-blue-400">OLOL</div>
+              <div className="text-4xl font-bold">{score.olol || 0}</div>
+            </div>
+            <div>
+              <div className="text-sm font-bold text-red-400">OTHER GUYS</div>
+              <div className="text-4xl font-bold">{score.other || 0}</div>
+            </div>
+          </div>
+        </div>
+        <br />
+        <button onClick={onEnd} className="bg-blue-600 text-white px-8 py-3 rounded-xl font-bold">New Game</button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="fade-in">
+      <div className="flex items-center justify-between py-3 mb-2">
+        <button onClick={onEnd} className="text-red-400 px-2 py-1 text-sm">End Game</button>
+        <div className="text-center">
+          <div className="text-lg font-bold">Inning {inning}</div>
+        </div>
+        <div className="text-sm text-gray-400 px-2">{isHome ? 'HOME' : 'AWAY'}</div>
+      </div>
+
+      <Scoreboard score={score} setScore={setScore} inning={inning} isTop={isTop} />
+
+      <div className={`text-center py-2 mb-4 rounded-lg font-bold text-lg ${
+        isBatting ? 'bg-yellow-600/30 text-yellow-300 border border-yellow-600/50' :
+        'bg-green-600/30 text-green-300 border border-green-600/50'
+      }`}>
+        {isBatting ? 'AT BAT' : 'IN THE FIELD'}
+      </div>
+
+      {isBatting ? (
+        <div>
+          <h3 className="font-semibold text-lg mb-3">Batting Order</h3>
+          <div className="space-y-1">
+            {battingOrder.map((p, idx) => {
+              const isUp = idx === currentBatter % battingOrder.length;
+              const isOnDeck = idx === (currentBatter + 1) % battingOrder.length;
+              const isInHole = idx === (currentBatter + 2) % battingOrder.length;
+              return (
+                <div key={p}
+                  className={`flex items-center gap-3 px-3 py-2.5 rounded-lg border ${
+                    isUp ? 'bg-yellow-600/30 border-yellow-500/50 text-yellow-100' :
+                    isOnDeck ? 'bg-orange-600/20 border-orange-500/30 text-orange-200' :
+                    isInHole ? 'bg-gray-700/50 border-gray-600/30 text-gray-300' :
+                    'bg-gray-800/50 border-gray-700/30 text-gray-500'
+                  }`}>
+                  <span className="w-6 text-right text-sm">{idx + 1}.</span>
+                  <span className="flex-1 font-medium">{shortName(p)}</span>
+                  {isUp && <span className="text-xs font-bold bg-yellow-600 px-2 py-0.5 rounded">UP</span>}
+                  {isOnDeck && <span className="text-xs bg-orange-700 px-2 py-0.5 rounded">DECK</span>}
+                  {isInHole && <span className="text-xs bg-gray-600 px-2 py-0.5 rounded">HOLE</span>}
+                </div>
+              );
+            })}
+          </div>
+          <div className="flex gap-2 mt-4">
+            <button onClick={() => setCurrentBatter(prev => prev + 1)}
+              className="flex-1 py-3 bg-yellow-600 rounded-xl font-bold">Next Batter</button>
+            <button onClick={() => setCurrentBatter(prev => Math.max(0, prev - 1))}
+              className="py-3 px-4 bg-gray-700 rounded-xl text-gray-300">Undo</button>
+          </div>
+        </div>
+      ) : (
+        <div>
+          <h3 className="font-semibold text-lg mb-3">Field Positions — Inning {inning}</h3>
+          {currentFieldPlan && (
+            <>
+              <DiamondView positions={currentFieldPlan.positions} />
+              <div className="mt-3 grid grid-cols-3 gap-1.5">
+                {POSITIONS.map(pos => (
+                  <div key={pos} className={`px-2 py-2 rounded-lg text-center ${
+                    pos === 'P' ? 'bg-red-900/50 border border-red-700/50' :
+                    pos === 'C' ? 'bg-purple-900/50 border border-purple-700/50' :
+                    INFIELD.has(pos) ? 'bg-blue-900/50 border border-blue-700/50' :
+                    'bg-green-900/50 border border-green-700/50'
+                  }`}>
+                    <div className="text-xs font-bold text-gray-400">{pos}</div>
+                    <div className="text-sm font-medium">{currentFieldPlan.positions[pos] ? shortName(currentFieldPlan.positions[pos]) : '—'}</div>
+                  </div>
+                ))}
+              </div>
+              {currentFieldPlan.bench.length > 0 && (
+                <div className="mt-3 bg-gray-800 rounded-lg p-3 border border-gray-700">
+                  <div className="text-xs font-bold text-gray-400 mb-1">BENCH</div>
+                  <div className="text-sm">{currentFieldPlan.bench.map(shortName).join(', ')}</div>
+                </div>
+              )}
+            </>
+          )}
+          <button onClick={() => setShowPitcherModal(true)}
+            className="w-full mt-3 py-3 bg-red-700/50 border border-red-600/50 rounded-xl font-medium text-red-200"
+          >Change Pitcher</button>
+        </div>
+      )}
+
+      <div className="sticky bottom-0 bg-gray-900/95 backdrop-blur border-t border-gray-700 p-4 -mx-4 mt-4">
+        <button onClick={advanceHalf}
+          className="w-full py-3.5 rounded-xl font-bold text-lg bg-blue-600 hover:bg-blue-500 text-white">
+          {isTop ? 'Go to Bottom of Inning' : inning >= maxInnings ? 'End Game' : 'Next Inning →'}
+        </button>
+      </div>
+
+      {showPitcherModal && (
+        <div className="fixed inset-0 bg-black/70 z-50 flex items-end">
+          <div className="w-full bg-gray-800 rounded-t-2xl p-4 pb-8 max-h-[80vh] overflow-y-auto">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-bold">Change Pitcher</h3>
+              <button onClick={() => setShowPitcherModal(false)} className="text-gray-400 text-2xl">✕</button>
+            </div>
+            <p className="text-sm text-gray-400 mb-3">
+              Current pitcher: <span className="text-white font-medium">{shortName(currentPitcher)}</span>.
+              New pitcher takes the mound; {shortName(currentPitcher)} moves to their spot.
+            </p>
+            <div className="space-y-2">
+              {players.filter(p => eligibility[p]?.P && p !== currentPitcher).map(p => {
+                const currentPos = currentFieldPlan ? Object.entries(currentFieldPlan.positions).find(([, v]) => v === p)?.[0] : null;
+                const onBench = currentFieldPlan?.bench?.includes(p);
+                return (
+                  <button key={p} onClick={() => changePitcher(p)}
+                    className="w-full text-left px-4 py-3 bg-gray-700 rounded-lg hover:bg-gray-600 font-medium flex justify-between items-center">
+                    <span>{p}</span>
+                    <span className="text-xs text-gray-400">{onBench ? 'BENCH' : currentPos || ''}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showLastOutModal && (
+        <div className="fixed inset-0 bg-black/70 z-50 flex items-end">
+          <div className="w-full bg-gray-800 rounded-t-2xl p-4 pb-8 max-h-[80vh] overflow-y-auto">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-bold">Who Made the Last Out?</h3>
+              <button onClick={() => { setShowLastOutModal(false); doAdvanceHalf(); }}
+                className="text-gray-400 text-sm">Skip</button>
+            </div>
+            <p className="text-sm text-gray-400 mb-3">
+              Select the batter who made the 3rd out. The next batter up will be the one after them.
+            </p>
+            <div className="space-y-2">
+              {battingOrder.map((p, idx) => (
+                <button key={p} onClick={() => handleLastOutSelected(idx)}
+                  className="w-full text-left px-4 py-3 bg-gray-700 rounded-lg hover:bg-gray-600 font-medium flex items-center gap-3">
+                  <span className="text-gray-500 text-sm w-6 text-right">{idx + 1}.</span>
+                  <span>{shortName(p)}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Main App ───────────────────────────────────────────────────────────
+function App() {
+  const [screen, setScreen] = useState('setup');
+  const [config, setConfig] = useState(null);
+  const [battingOrder, setBattingOrder] = useState([]);
+  const [fieldPlan, setFieldPlan] = useState([]);
+  const [score, setScore] = useState({ olol: 0, other: 0 });
+
+  const handleGenerate = (cfg) => {
+    setConfig(cfg);
+    const shuffled = [...cfg.players].sort(() => Math.random() - 0.5);
+    setBattingOrder(shuffled);
+
+    const plan = generateFieldPlan(cfg.players, cfg.eligibility, cfg.innings, cfg.catcherPlan, cfg.pitcher);
+    setFieldPlan(plan);
+    setScreen('review');
+  };
+
+  const handleStart = () => {
+    setScore({ olol: 0, other: 0 });
+    setScreen('game');
+  };
+
+  const handleEnd = () => {
+    setScreen('setup');
+    setConfig(null);
+    setBattingOrder([]);
+    setFieldPlan([]);
+    setScore({ olol: 0, other: 0 });
+  };
+
+  return (
+    <div className="max-w-md mx-auto px-4 pb-24 min-h-screen">
+      {screen === 'setup' && <SetupScreen onGenerate={handleGenerate} />}
+      {screen === 'review' && (
+        <ReviewScreen config={config} battingOrder={battingOrder} setBattingOrder={setBattingOrder}
+          fieldPlan={fieldPlan} onStart={handleStart}
+          onBack={() => setScreen('setup')} />
+      )}
+      {screen === 'game' && (
+        <GameScreen config={config} battingOrder={battingOrder} fieldPlan={fieldPlan}
+          setFieldPlan={setFieldPlan}
+          score={score} setScore={setScore} onEnd={handleEnd} />
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
